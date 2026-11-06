@@ -146,6 +146,8 @@ pub enum Side {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MergeError {
+    #[error("This comparison is a read-only preview")]
+    ReadOnly,
     #[error("The documents changed; compare again before accepting this block.")]
     StaleResult,
     #[error("This difference block no longer exists.")]

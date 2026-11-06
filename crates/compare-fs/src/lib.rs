@@ -1,13 +1,19 @@
 //! Explicit text decoding, guarded saves, and exact directory comparison.
 mod copy;
+mod preview;
+mod scan;
 use compare_core::DocumentSnapshot;
 pub use copy::{
     execute_copy, prepare_copy, CopyItemResult, CopyItemStatus, CopyOperation, CopyPlan, CopyReport,
 };
 use encoding_rs::GBK;
+pub use preview::{
+    load_preview, read_preview_page, verify_preview, PreviewCursor, PreviewInfo, PREVIEW_MAX_BYTES,
+    PREVIEW_MAX_LINES,
+};
+pub use scan::{compare_directories_streaming, DirectoryBatch, DirectoryPhase};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -17,9 +23,9 @@ use std::{
     },
 };
 use thiserror::Error;
-use walkdir::WalkDir;
 
 pub const MAX_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_EDITABLE_LINES: usize = 250_000;
 
 #[derive(Debug, Error)]
 pub enum FileError {
@@ -31,6 +37,12 @@ pub enum FileError {
     },
     #[error("{0}: text files larger than 16 MiB are not editable in this prototype")]
     TooLarge(PathBuf),
+    #[error("{0}: too many lines for editable comparison; use a read-only preview")]
+    TooManyLines(PathBuf),
+    #[error("Read-only previews cannot be edited or saved")]
+    ReadOnlyPreview,
+    #[error("Invalid preview position")]
+    InvalidPreviewPosition,
     #[error("Invalid {0} text. Select the correct encoding; invalid bytes are never replaced.")]
     InvalidEncoding(&'static str),
     #[error(
@@ -93,6 +105,14 @@ pub fn decode(
     bytes: &[u8],
     selected: Option<TextEncoding>,
 ) -> Result<(String, TextFormat), FileError> {
+    let (format, skip) = detect_format(bytes, selected)?;
+    Ok((decode_payload(&bytes[skip..], format.encoding)?, format))
+}
+
+fn detect_format(
+    bytes: &[u8],
+    selected: Option<TextEncoding>,
+) -> Result<(TextFormat, usize), FileError> {
     let detected = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         Some((TextEncoding::Utf8, 3))
     } else if bytes.starts_with(&[0xff, 0xfe]) {
@@ -109,7 +129,10 @@ pub fn decode(
         return Err(FileError::InvalidEncoding(encoding.label()));
     }
     let bom = detected.is_some();
-    let content = &bytes[detected.map_or(0, |(_, n)| n)..];
+    Ok((TextFormat { encoding, bom }, detected.map_or(0, |(_, n)| n)))
+}
+
+fn decode_payload(content: &[u8], encoding: TextEncoding) -> Result<String, FileError> {
     let text = match encoding {
         TextEncoding::Utf8 => std::str::from_utf8(content)
             .map(str::to_owned)
@@ -139,7 +162,7 @@ pub fn decode(
     if text.contains('\0') {
         return Err(FileError::Binary);
     }
-    Ok((text, TextFormat { encoding, bom }))
+    Ok(text)
 }
 
 pub fn encode(text: &str, format: TextFormat) -> Result<Vec<u8>, FileError> {
@@ -179,6 +202,7 @@ pub struct LoadedDocument {
     pub path: Option<PathBuf>,
     pub document: DocumentSnapshot,
     pub format: TextFormat,
+    pub preview: Option<PreviewInfo>,
     original_bytes: Arc<[u8]>,
     original_text: Arc<str>,
     line_ending: &'static str,
@@ -193,6 +217,7 @@ impl LoadedDocument {
                 encoding: TextEncoding::Utf8,
                 bom: false,
             },
+            preview: None,
             original_bytes: text.as_bytes().into(),
             original_text: text.into(),
             line_ending: line_ending_label(text),
@@ -245,6 +270,11 @@ pub fn load_document(
         return Err(FileError::TooLarge(path.to_owned()));
     }
     let (text, format) = decode(&bytes, encoding)?;
+    let lines = text.bytes().filter(|b| *b == b'\n').count()
+        + usize::from(!text.is_empty() && !text.ends_with('\n'));
+    if lines > MAX_EDITABLE_LINES {
+        return Err(FileError::TooManyLines(path.to_owned()));
+    }
     // Keep an absolute path without resolving the final symlink; saving it must be rejected.
     let absolute = std::path::absolute(path).map_err(|e| io_error(path, e))?;
     let document = DocumentSnapshot::new(text, 0);
@@ -254,6 +284,7 @@ pub fn load_document(
         original_text: document.shared_text(),
         document,
         format,
+        preview: None,
         original_bytes: bytes.into(),
         line_ending,
     })
@@ -261,6 +292,9 @@ pub fn load_document(
 
 /// Prepare all bytes before touching the original, then replace from a same-directory temp file.
 pub fn save_document(document: &mut LoadedDocument) -> Result<(), FileError> {
+    if document.preview.is_some() {
+        return Err(FileError::ReadOnlyPreview);
+    }
     let path = document.path.as_ref().ok_or_else(|| {
         io_error(
             Path::new("untitled"),
@@ -328,6 +362,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EntryStatus {
+    Pending,
     Equal,
     Different,
     LeftOnly,
@@ -353,13 +388,19 @@ pub struct DirectoryReport {
     pub left: PathBuf,
     pub right: PathBuf,
     pub entries: Vec<DirectoryEntryPair>,
+    pub complete: bool,
 }
 
 impl DirectoryReport {
     pub fn different_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| !matches!(e.status, EntryStatus::Equal | EntryStatus::Directory))
+            .filter(|e| {
+                !matches!(
+                    e.status,
+                    EntryStatus::Equal | EntryStatus::Directory | EntryStatus::Pending
+                )
+            })
             .count()
     }
     pub fn error_count(&self) -> usize {
@@ -370,161 +411,13 @@ impl DirectoryReport {
     }
 }
 
-#[derive(Default)]
-struct Pair {
-    left: Option<Entry>,
-    right: Option<Entry>,
-}
-struct Entry {
-    kind: EntryKind,
-    size: u64,
-    error: Option<String>,
-}
-
 pub fn compare_directories(
     left: &Path,
     right: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(usize),
 ) -> Result<DirectoryReport, FileError> {
-    let left = std::path::absolute(left).map_err(|e| io_error(left, e))?;
-    let right = std::path::absolute(right).map_err(|e| io_error(right, e))?;
-    for path in [&left, &right] {
-        if !fs::metadata(path).map_err(|e| io_error(path, e))?.is_dir() {
-            return Err(FileError::NotDirectory(path.to_owned()));
-        }
-    }
-    let mut pairs: BTreeMap<PathBuf, Pair> = BTreeMap::new();
-    let mut count = 0usize;
-    for (root, is_left) in [(&left, true), (&right, false)] {
-        for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
-            check_cancel(cancel)?;
-            let (path, item) = match entry {
-                Ok(entry) => {
-                    let file_type = entry.file_type();
-                    let kind = if file_type.is_symlink() {
-                        EntryKind::Symlink
-                    } else if file_type.is_file() {
-                        EntryKind::File
-                    } else if file_type.is_dir() {
-                        EntryKind::Directory
-                    } else {
-                        EntryKind::Other
-                    };
-                    let metadata = entry.metadata();
-                    (
-                        entry.path().to_owned(),
-                        Entry {
-                            kind,
-                            size: metadata.as_ref().map_or(0, |m| m.len()),
-                            error: metadata.err().map(|e| e.to_string()),
-                        },
-                    )
-                }
-                Err(error) => {
-                    let path = error.path().unwrap_or(root).to_owned();
-                    (
-                        path,
-                        Entry {
-                            kind: EntryKind::Other,
-                            size: 0,
-                            error: Some(error.to_string()),
-                        },
-                    )
-                }
-            };
-            let relative = path.strip_prefix(root).unwrap_or(&path).to_owned();
-            let pair = pairs.entry(relative).or_default();
-            if is_left {
-                pair.left = Some(item);
-            } else {
-                pair.right = Some(item);
-            }
-            count += 1;
-            if count.is_multiple_of(64) {
-                progress(count);
-            }
-        }
-    }
-    let mut entries = Vec::with_capacity(pairs.len());
-    for (relative_path, pair) in pairs {
-        check_cancel(cancel)?;
-        let mut error = pair
-            .left
-            .as_ref()
-            .and_then(|e| e.error.clone())
-            .or_else(|| pair.right.as_ref().and_then(|e| e.error.clone()));
-        let mut status = match (&pair.left, &pair.right) {
-            (Some(l), Some(r)) if l.kind != r.kind => EntryStatus::TypeConflict,
-            (Some(l), Some(_)) if l.kind == EntryKind::Directory => EntryStatus::Directory,
-            (Some(l), Some(r)) if l.kind == EntryKind::File => {
-                if l.size != r.size {
-                    EntryStatus::Different
-                } else {
-                    match files_equal(
-                        &left.join(&relative_path),
-                        &right.join(&relative_path),
-                        cancel,
-                    ) {
-                        Ok(true) => EntryStatus::Equal,
-                        Ok(false) => EntryStatus::Different,
-                        Err(FileError::Cancelled) => return Err(FileError::Cancelled),
-                        Err(e) => {
-                            error = Some(e.to_string());
-                            EntryStatus::Error
-                        }
-                    }
-                }
-            }
-            (Some(l), Some(_)) if l.kind == EntryKind::Symlink => {
-                match (
-                    fs::read_link(left.join(&relative_path)),
-                    fs::read_link(right.join(&relative_path)),
-                ) {
-                    (Ok(l), Ok(r)) => {
-                        if l == r {
-                            EntryStatus::Equal
-                        } else {
-                            EntryStatus::Different
-                        }
-                    }
-                    (Err(e), _) | (_, Err(e)) => {
-                        error = Some(e.to_string());
-                        EntryStatus::Error
-                    }
-                }
-            }
-            (Some(_), Some(_)) => {
-                error = Some("Unsupported file type".into());
-                EntryStatus::Error
-            }
-            (Some(_), None) => EntryStatus::LeftOnly,
-            (None, Some(_)) => EntryStatus::RightOnly,
-            (None, None) => unreachable!(),
-        };
-        if error.is_some() {
-            status = EntryStatus::Error;
-        }
-        entries.push(DirectoryEntryPair {
-            relative_path,
-            status,
-            error,
-            left_kind: pair.left.as_ref().map(|e| e.kind),
-            right_kind: pair.right.as_ref().map(|e| e.kind),
-            left_size: pair.left.as_ref().map(|e| e.size),
-            right_size: pair.right.as_ref().map(|e| e.size),
-        });
-        count += 1;
-        if count.is_multiple_of(64) {
-            progress(count);
-        }
-    }
-    progress(count);
-    Ok(DirectoryReport {
-        left: left.to_owned(),
-        right: right.to_owned(),
-        entries,
-    })
+    compare_directories_streaming(left, right, cancel, |batch| progress(batch.scanned))
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), FileError> {

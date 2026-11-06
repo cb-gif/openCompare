@@ -152,11 +152,16 @@ impl CompareApp {
         let mut close = false;
         let mut changed = false;
         let mut step = None;
+        let preview = self.session.as_ref().is_some_and(TextSession::is_read_only);
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search.query)
                     .id_salt("text-search")
-                    .hint_text("查找两侧文本…")
+                    .hint_text(if preview {
+                        "查找当前页两侧文本…"
+                    } else {
+                        "查找两侧文本…"
+                    })
                     .desired_width(270.0),
             );
             if self.search.focus_requested {

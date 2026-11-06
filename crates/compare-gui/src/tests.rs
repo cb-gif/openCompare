@@ -233,3 +233,168 @@ fn invalid_configuration_is_kept_when_the_gui_cannot_persist_state() {
     assert!(app.error.is_some());
     assert!(app.state_dirty_at.is_none());
 }
+
+#[test]
+fn read_only_pages_navigate_in_both_directions_after_one_side_reaches_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("large.txt");
+    let right = directory.path().join("short.txt");
+    fs::write(&left, "same\n".repeat(compare_fs::MAX_EDITABLE_LINES + 1)).unwrap();
+    fs::write(&right, "same\n".repeat(compare_fs::PREVIEW_MAX_LINES + 1)).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = CompareApp::initialize(
+        &ctx,
+        AppState::default(),
+        directory.path().join("state.json"),
+        None,
+        &[],
+    );
+    app.perform(
+        Action::Open {
+            left: left.clone(),
+            right: right.clone(),
+            directory: false,
+        },
+        &ctx,
+    );
+    wait_for_jobs(&mut app);
+    let session = app.session.as_ref().unwrap();
+    assert!(session.is_read_only());
+    assert_eq!(session.byte_equal, Some(false));
+    assert!(session.diff.as_ref().unwrap().hunks.is_empty());
+    app.handle_text_action(TextAction::Edit(Side::Right));
+    app.handle_text_action(TextAction::Save(Side::Right));
+    app.handle_text_action(TextAction::Accept(Side::Left));
+    assert!(app.editor.is_none());
+    assert!(app.busy.is_none());
+    let output = render_text(&mut app, &ctx);
+    assert!(output
+        .shapes
+        .iter()
+        .any(|shape| shape_contains(&shape.shape, "完整文件字节不同")));
+    for expected_page in 1..=2 {
+        app.handle_text_action(TextAction::Page(true));
+        wait_for_jobs(&mut app);
+        assert_eq!(app.preview_navigation.current, expected_page);
+    }
+    assert!(app
+        .session
+        .as_ref()
+        .unwrap()
+        .right
+        .document
+        .text()
+        .is_empty());
+    app.handle_text_action(TextAction::Page(false));
+    wait_for_jobs(&mut app);
+    assert_eq!(
+        app.session.as_ref().unwrap().right.document.text(),
+        "same\n"
+    );
+    let output = render_text(&mut app, &ctx);
+    assert!(output
+        .shapes
+        .iter()
+        .any(|shape| shape_contains(&shape.shape, "2001")));
+    app.handle_text_action(TextAction::Page(false));
+    wait_for_jobs(&mut app);
+    assert_eq!(app.preview_navigation.current, 0);
+    assert!(app
+        .session
+        .as_ref()
+        .unwrap()
+        .diff
+        .as_ref()
+        .unwrap()
+        .hunks
+        .is_empty());
+    assert_eq!(
+        fs::read_to_string(&right).unwrap(),
+        "same\n".repeat(compare_fs::PREVIEW_MAX_LINES + 1)
+    );
+    fs::write(&left, "external change").unwrap();
+    app.handle_text_action(TextAction::Page(true));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.busy.is_some() {
+        app.poll();
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.error.is_some());
+    assert_eq!(app.preview_navigation.current, 0);
+    assert_eq!(app.session.as_ref().unwrap().byte_equal, Some(false));
+}
+
+#[test]
+fn incremental_scan_can_be_cancelled_filtered_and_restarted_without_enabling_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("left");
+    let right = directory.path().join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    for i in 0..1200 {
+        fs::write(left.join(format!("file-{i:04}.txt")), "same").unwrap();
+    }
+    let ctx = egui::Context::default();
+    let mut app = CompareApp::initialize(
+        &ctx,
+        AppState::default(),
+        directory.path().join("state.json"),
+        None,
+        &[],
+    );
+    let scan = || Job::CompareDirectories {
+        left: left.clone(),
+        right: right.clone(),
+    };
+    app.submit(scan(), BusyKind::Directory);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll();
+        if app
+            .directory
+            .as_ref()
+            .is_some_and(|r| !r.entries.is_empty())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app.busy.is_some());
+    assert!(!app.directory.as_ref().unwrap().complete);
+    app.directory_filter = app.directory.as_ref().unwrap().entries[0]
+        .relative_path
+        .to_string_lossy()
+        .to_uppercase();
+    app.refresh_directory_filter();
+    assert_eq!(app.filtered_entries.len(), 1);
+    app.copy.selection.insert(app.filtered_entries[0]);
+    assert!(!app.can_copy_selection(Side::Left));
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| app.directory_view(ui));
+    });
+    app.cancel_current_job();
+    assert_eq!(app.directory_phase, Some(DirectoryPhase::Cancelled));
+    assert!(!app.directory.as_ref().unwrap().complete);
+    assert!(!app.can_copy_selection(Side::Left));
+    let retained = app.directory.as_ref().unwrap().entries.len();
+    app.poll();
+    assert_eq!(app.directory.as_ref().unwrap().entries.len(), retained);
+    app.submit(scan(), BusyKind::Directory);
+    wait_for_jobs(&mut app);
+    assert!(app.directory.as_ref().unwrap().complete);
+    assert_eq!(app.directory.as_ref().unwrap().entries.len(), 1200);
+    assert_eq!(app.directory_phase, Some(DirectoryPhase::Complete));
+    assert_eq!(app.filtered_entries.len(), 1);
+    app.copy.selection.insert(app.filtered_entries[0]);
+    assert!(app.can_copy_selection(Side::Left));
+    app.apply_directory_batch(compare_fs::DirectoryBatch {
+        left,
+        right,
+        phase: DirectoryPhase::Discovering,
+        scanned: 0,
+        entries: Vec::new(),
+    });
+    assert_eq!(app.directory_phase, Some(DirectoryPhase::Complete));
+}

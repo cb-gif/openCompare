@@ -652,6 +652,7 @@ name = "compare-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "compare-app",
  "compare-core",
  "compare-fs",
  "serde_json",

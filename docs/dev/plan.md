@@ -6,7 +6,7 @@
 
 - `[x]`：该节点自身范围有证据；`[ ]`：待开发、进行中、待验收或阻塞，具体进展写在该节点备注。
 - BASE 是可复用的旧原型，DOC 是规划/规范交付；二者不代表新桌面功能已交付，不与目标功能合算完成率。
-- 目标桌面节点当前全部未勾选。历史 32 项测试和 Windows 窗口记录不代表 Tauri/macOS/安装包已验证。
+- 目标桌面节点当前全部未勾选。历史原型的 32 项基础测试、45 项扩展测试及 Windows 窗口记录不代表 Tauri/macOS/安装包已验证。
 - 每个节点包含稳定 ID、依赖、验收和证据入口。领取时补负责人、开发分支、涉及文件；并行任务避开共享 DTO/锁文件/主题冲突。
 - 依赖的验收条件满足后再进入后继实施；隔离技术探针可以提前验证，不能将探针成功算成前置节点完成。
 - 没有实际双平台证据时保持待验收。完成节点填写实际证据；仅有截图、编译、文档或 AI 自报均不够证明功能交付。
@@ -35,23 +35,23 @@
 
 - [x] **BASE-02 文件与目录操作基线**
   - 阶段：源码与历史证据；依赖：—。
-  - 验收：编码、无损未编辑保存、外部修改检查、目录内容比较、受保护批量复制已有实现。
-  - 证据：crates/compare-fs/src/lib.rs、copy.rs 及 copy_creates_nested_files_and_overwrites_only_previewed_targets、cancelling_a_batch_preserves_committed_results_and_marks_remaining_files 等测试；validation.md。
+  - 验收：编码、无损未编辑保存、外部修改检查、有界只读分页、目录渐进内容比较及受保护批量复制已有实现；不是目标目录树或新桌面验收。
+  - 证据：crates/compare-fs/src/lib.rs、copy.rs、preview.rs、scan.rs；分页编码/只读保护、待比较状态、取消与复制测试；validation.md 的原型记录。
 
 - [x] **BASE-03 会话与任务基线**
   - 阶段：源码与历史证据；依赖：—。
-  - 验收：TextSession、后台任务和带版本会话配置已有实现；多文档身份与正式配置目录未完成。
-  - 证据：crates/compare-app/src/lib.rs、persistence.rs；session_metadata_round_trips_without_document_contents、corrupt_or_future_settings_are_not_silently_replaced；validation.md。
+  - 验收：TextSession、普通/只读分页打开、后台任务、有界扫描事件与带版本会话配置已有实现；多文档身份与正式配置目录未完成。
+  - 证据：crates/compare-app/src/lib.rs、open.rs、persistence.rs；分页页外差异、扫描队列背压/过期批次与会话配置测试；validation.md。
 
 - [x] **BASE-04 原型 GUI 与 CLI**
   - 阶段：源码与历史证据；依赖：—。
-  - 验收：egui 文本/目录、查找、复制和 CLI 已有入口；GUI 原生验证范围按记录限定。
+  - 验收：egui 文本/目录、查找、复制、只读翻页、取消/重扫和 CLI 已有入口；CLI 区分完整字节结果与首页 hunks，扫描标明 complete。GUI 原生验证范围按记录限定。
   - 证据：crates/compare-gui/src/tests.rs、crates/compare-cli/tests/cli.rs；validation.md 的 Windows 原生轮次记录。
 
 - [x] **BASE-05 现有 CI 与基准**
   - 阶段：源码与历史证据；依赖：—。
-  - 验收：Windows Rust CI 配置、可复现稀疏文本 CLI 基准脚本存在；不代表本次远端 CI 已执行。
-  - 证据：.github/workflows/ci.yml、scripts/benchmark.mjs；validation.md 的历史 10 万行测量。
+  - 验收：Windows Rust CI 配置、稀疏文本及大文件/目录 CLI 基准脚本存在；不代表当前环境或远端 CI 已重新执行。
+  - 证据：.github/workflows/ci.yml、scripts/benchmark.mjs、scripts/benchmark-preview.mjs；validation.md 的历史 10 万行、32 MiB 文本及 1,000 项目录测量。
 
 ## 规范与协作基础
 

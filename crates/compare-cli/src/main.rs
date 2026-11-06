@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use compare_core::{compare, CompareOptions, DocumentSnapshot};
-use compare_fs::{compare_directories, load_document, EntryStatus, TextEncoding};
+use compare_app::open_text_session;
+use compare_core::{CompareOptions, DocumentSnapshot};
+use compare_fs::{compare_directories, EntryStatus, TextEncoding};
 use serde_json::json;
 use std::{
     io::{self, Write},
@@ -91,14 +92,30 @@ fn main() -> ExitCode {
 fn run(cli: Cli, output: &mut impl Write) -> Result<u8, Box<dyn std::error::Error>> {
     match cli.command {
         Command::Diff(args) => {
-            let left = load_document(&args.left, args.left_encoding.map(Into::into))?;
-            let right = load_document(&args.right, args.right_encoding.map(Into::into))?;
             let options = CompareOptions {
                 ignore_trailing_whitespace: args.ignore_trailing_whitespace,
                 ignore_case: args.ignore_case,
                 ignore_line_endings: args.ignore_line_endings,
             };
-            let diff = compare(&left.document, &right.document, options);
+            let session = open_text_session(
+                &args.left,
+                &args.right,
+                args.left_encoding.map(Into::into),
+                args.right_encoding.map(Into::into),
+                options,
+                &AtomicBool::new(false),
+            )?;
+            let preview = session.is_read_only();
+            if preview && options != CompareOptions::default() {
+                return Err("Large-file preview supports exact byte comparison only; remove ignore options.".into());
+            }
+            let left = &session.left;
+            let right = &session.right;
+            let diff = session
+                .diff
+                .as_ref()
+                .expect("opened sessions contain a comparison");
+            let equal = session.byte_equal.unwrap_or(diff.hunks.is_empty());
             if args.json {
                 let hunks: Vec<_> = diff
                     .hunks
@@ -110,11 +127,25 @@ fn run(cli: Cli, output: &mut impl Write) -> Result<u8, Box<dyn std::error::Erro
                     .collect();
                 serde_json::to_writer_pretty(
                     &mut *output,
-                    &json!({ "equal": hunks.is_empty(), "hunks": hunks,
+                    &json!({ "equal": equal, "hunks": hunks,
+                    "mode": if preview { "read_only_preview" } else { "text" },
+                    "comparison_scope": if preview { "full_file_bytes" } else { "full_text" },
+                    "hunk_scope": if preview { "first_page" } else { "full_text" },
+                    "left_preview": left.preview.as_ref().map(|p| json!({ "start_byte": p.cursor.byte_offset,
+                        "end_byte": p.end.byte_offset, "file_bytes": p.file_bytes, "has_more": p.has_more() })),
+                    "right_preview": right.preview.as_ref().map(|p| json!({ "start_byte": p.cursor.byte_offset,
+                        "end_byte": p.end.byte_offset, "file_bytes": p.file_bytes, "has_more": p.has_more() })),
                     "options": options, "coarse_alignment": diff.coarse_alignment,
                     "left_encoding": left.format.encoding, "right_encoding": right.format.encoding }),
                 )?;
                 writeln!(output)?;
+            } else if preview {
+                writeln!(
+                    output,
+                    "Complete files are byte-{}.",
+                    if equal { "equal" } else { "different" }
+                )?;
+                writeln!(output, "Read-only preview: {} difference blocks on the first page only. Use the desktop app to browse further pages.", diff.hunks.len())?;
             } else if diff.hunks.is_empty() {
                 writeln!(output, "No differences under selected rules.")?;
             } else {
@@ -140,7 +171,7 @@ fn run(cli: Cli, output: &mut impl Write) -> Result<u8, Box<dyn std::error::Erro
                     print_lines(output, '+', &right.document, h.right.clone())?;
                 }
             }
-            Ok(u8::from(!diff.hunks.is_empty()))
+            Ok(u8::from(!equal))
         }
         Command::Dir(args) => {
             let report =

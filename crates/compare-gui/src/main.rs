@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod copy_ui;
+mod directory_ui;
+mod preview_ui;
 mod search_ui;
 mod session_ui;
 #[cfg(test)]
@@ -10,7 +12,9 @@ use compare_app::{
     StoredComparison, TextSession,
 };
 use compare_core::{AlignedRow, CompareOptions, DocumentSnapshot, RowKind, Side};
-use compare_fs::{DirectoryReport, EntryKind, EntryStatus, LoadedDocument, TextEncoding};
+use compare_fs::{
+    DirectoryPhase, DirectoryReport, EntryKind, EntryStatus, LoadedDocument, TextEncoding,
+};
 use eframe::egui::{
     self, text::LayoutJob, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
@@ -80,6 +84,7 @@ enum Action {
     Exit,
 }
 enum TextAction {
+    Page(bool),
     Find,
     Undo,
     Redo,
@@ -95,6 +100,11 @@ struct Editor {
 }
 
 struct CompareApp {
+    preview_navigation: preview_ui::PreviewNavigation,
+    directory_phase: Option<DirectoryPhase>,
+    directory_index: std::collections::HashMap<PathBuf, usize>,
+    directory_search_keys: Vec<String>,
+    directory_counts: [usize; 3],
     copy: copy_ui::CopyUi,
     search: search_ui::SearchState,
     state: AppState,
@@ -145,6 +155,11 @@ impl CompareApp {
     ) -> Self {
         configure_style(ctx);
         let mut app = Self {
+            preview_navigation: preview_ui::PreviewNavigation::default(),
+            directory_phase: None,
+            directory_index: Default::default(),
+            directory_search_keys: Vec::new(),
+            directory_counts: [0; 3],
             copy: copy_ui::CopyUi::default(),
             search: search_ui::SearchState::default(),
             options: state.options,
@@ -204,11 +219,27 @@ impl CompareApp {
         ));
         self.view = View::Text;
         self.selected_hunk = 0;
+        self.reset_preview_navigation();
         self.notice = "示例会话 · 打开两个文件开始比较，或拖入两个文件".into();
         self.search.refresh(self.session.as_ref());
     }
 
     fn submit(&mut self, job: Job, kind: BusyKind) {
+        if let Job::CompareDirectories { left, right } = &job {
+            self.directory = Some(DirectoryReport {
+                left: std::path::absolute(left).unwrap_or_else(|_| left.clone()),
+                right: std::path::absolute(right).unwrap_or_else(|_| right.clone()),
+                entries: Vec::new(),
+                complete: false,
+            });
+            self.directory_phase = Some(DirectoryPhase::Discovering);
+            self.directory_index.clear();
+            self.directory_search_keys.clear();
+            self.filtered_entries.clear();
+            self.directory_counts = [0; 3];
+            self.copy.selection.clear();
+            self.view = View::Directory;
+        }
         self.worker.submit(job);
         self.busy = Some(Busy {
             kind,
@@ -219,6 +250,19 @@ impl CompareApp {
 
     fn recompare(&mut self) {
         self.search.refresh(None);
+        if let Some(session) = self.session.as_ref().filter(|s| s.is_read_only()) {
+            if let (Some(left), Some(right)) = (&session.left.path, &session.right.path) {
+                let job = Job::OpenFiles {
+                    left: left.clone(),
+                    right: right.clone(),
+                    left_encoding: Some(session.left.format.encoding),
+                    right_encoding: Some(session.right.format.encoding),
+                    options: self.options,
+                };
+                self.submit(job, BusyKind::Open);
+                return;
+            }
+        }
         if let Some(session) = &mut self.session {
             session.diff = None;
             let job = session.comparison_job(self.options);
@@ -227,15 +271,27 @@ impl CompareApp {
     }
 
     fn poll(&mut self) {
+        let updates = self.worker.poll_directory_updates();
+        if !updates.is_empty() {
+            for batch in updates {
+                self.apply_directory_batch(batch);
+            }
+            self.refresh_directory_filter();
+        }
         let Some(event) = self.worker.poll() else {
             return;
         };
+        let previous_kind = self.busy.as_ref().map(|busy| busy.kind);
         let elapsed = self
             .busy
             .take()
             .map_or(Duration::ZERO, |b| b.started.elapsed());
         match event.result {
             Err(error) => {
+                if previous_kind == Some(BusyKind::Directory) {
+                    self.directory_phase = Some(DirectoryPhase::Failed);
+                }
+                self.preview_navigation.pending = None;
                 self.error = Some(error);
                 self.notice = "操作失败，原会话仍保留".into();
             }
@@ -244,6 +300,7 @@ impl CompareApp {
                 self.view = View::Text;
                 self.selected_hunk = 0;
                 self.jump_row = Some(0);
+                self.reset_preview_navigation();
                 self.notice = format!("比较完成 · {:.0} ms", elapsed.as_secs_f64() * 1000.0);
                 self.remember_current();
                 self.search.refresh(self.session.as_ref());
@@ -270,6 +327,9 @@ impl CompareApp {
                     report.error_count()
                 );
                 self.directory = Some(report);
+                self.directory_phase = Some(DirectoryPhase::Complete);
+                self.directory_index.clear();
+                self.directory_search_keys.clear();
                 self.selected_entry = None;
                 self.view = View::Directory;
                 self.refresh_directory_filter();
@@ -282,6 +342,20 @@ impl CompareApp {
                 self.notice = format!("{}文件已保存", side_label(side));
             }
             Ok(JobOutput::Searched(_)) => {}
+            Ok(JobOutput::PreviewPage(session)) => {
+                self.session = Some(*session);
+                if let Some((index, cursors)) = self.preview_navigation.pending.take() {
+                    if index >= self.preview_navigation.history.len() {
+                        self.preview_navigation.history.push(cursors);
+                    }
+                    self.preview_navigation.current = index;
+                }
+                self.selected_hunk = 0;
+                self.jump_row = Some(0);
+                self.horizontal_offset = 0.0;
+                self.search.refresh(self.session.as_ref());
+                self.notice = "只读预览已翻页；差异与查找仅覆盖当前页".into();
+            }
             Ok(JobOutput::CopyPrepared(plan)) => {
                 self.copy.preview = Some(plan);
             }
@@ -340,6 +414,7 @@ impl CompareApp {
 
     fn handle_text_action(&mut self, action: TextAction) {
         match action {
+            TextAction::Page(forward) => self.request_preview_page(forward),
             TextAction::Find => {
                 self.search.visible = true;
                 self.search.focus_requested = true;
@@ -360,6 +435,9 @@ impl CompareApp {
             }
             TextAction::Edit(side) => {
                 if let Some(session) = &self.session {
+                    if session.is_read_only() {
+                        return;
+                    }
                     self.editor = Some(Editor {
                         side,
                         text: session.document(side).document.text().to_owned(),
@@ -368,6 +446,9 @@ impl CompareApp {
             }
             TextAction::Save(side) => {
                 if let Some(session) = &self.session {
+                    if session.is_read_only() {
+                        return;
+                    }
                     self.submit(
                         Job::Save {
                             side,
@@ -380,6 +461,9 @@ impl CompareApp {
             TextAction::Recompare => self.recompare(),
             other => {
                 if let Some(session) = &mut self.session {
+                    if session.is_read_only() {
+                        return;
+                    }
                     match other {
                         TextAction::Undo => session.undo(),
                         TextAction::Redo => session.redo(),
@@ -485,14 +569,7 @@ impl CompareApp {
                             busy.started.elapsed().as_secs_f32()
                         ));
                         if busy.kind != BusyKind::Save && ui.small_button("取消").clicked() {
-                            if busy.kind == BusyKind::Copy {
-                                self.worker.request_cancel();
-                                self.notice = "正在停止复制，请等待逐项结果".into();
-                            } else {
-                                self.worker.cancel();
-                                self.busy = None;
-                                self.notice = "任务已取消，已有会话仍保留".into();
-                            }
+                            self.cancel_current_job();
                         }
                     } else {
                         ui.label(RichText::new(&self.notice).small().color(MUTED));
@@ -508,12 +585,21 @@ impl CompareApp {
         };
         let mut action = None;
         let ready = self.busy.is_none();
+        let editable = ready && !session.is_read_only();
         let count = session.diff.as_ref().map_or(0, |d| d.hunks.len());
         ui.horizontal(|ui| {
             ui.label(RichText::new("文本比较").size(21.0).strong());
             ui.add_space(12.0);
             ui.label(
-                RichText::new(format!("{count} 个差异块")).color(if count == 0 {
+                RichText::new(format!(
+                    "{}{count} 个差异块",
+                    if session.is_read_only() {
+                        "当前页 "
+                    } else {
+                        ""
+                    }
+                ))
+                .color(if count == 0 {
                     ACCENT
                 } else {
                     Color32::from_rgb(245, 190, 115)
@@ -544,10 +630,13 @@ impl CompareApp {
             });
         });
         ui.add_space(12.0);
+        if let Some(page_action) = self.preview_toolbar(ui) {
+            action = Some(page_action);
+        }
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("比较规则").small().color(MUTED));
-            ui.add_enabled_ui(ready, |ui| {
+            ui.add_enabled_ui(editable, |ui| {
                 changed |= ui
                     .checkbox(&mut self.options.ignore_trailing_whitespace, "忽略行尾空白")
                     .changed();
@@ -584,13 +673,13 @@ impl CompareApp {
             );
             ui.add_space(16.0);
             if ui
-                .add_enabled(ready && count > 0, egui::Button::new("取左 → 右"))
+                .add_enabled(editable && count > 0, egui::Button::new("取左 → 右"))
                 .clicked()
             {
                 action = Some(TextAction::Accept(Side::Left));
             }
             if ui
-                .add_enabled(ready && count > 0, egui::Button::new("左 ← 取右"))
+                .add_enabled(editable && count > 0, egui::Button::new("左 ← 取右"))
                 .clicked()
             {
                 action = Some(TextAction::Accept(Side::Right));
@@ -629,7 +718,9 @@ impl CompareApp {
                                 |ui| {
                                     if ui
                                         .add_enabled(
-                                            ready && document.is_dirty() && document.path.is_some(),
+                                            editable
+                                                && document.is_dirty()
+                                                && document.path.is_some(),
                                             egui::Button::new("保存"),
                                         )
                                         .clicked()
@@ -638,7 +729,8 @@ impl CompareApp {
                                     }
                                     if ui
                                         .add_enabled(
-                                            ready && document.document.text().len() <= 512 * 1024,
+                                            editable
+                                                && document.document.text().len() <= 512 * 1024,
                                             egui::Button::new("编辑"),
                                         )
                                         .on_hover_text(
@@ -669,6 +761,24 @@ impl CompareApp {
                                 .truncate(),
                             );
                         }
+                        if let Some(preview) = &document.preview {
+                            ui.label(
+                                RichText::new(format!(
+                                    "第 {} 行{}起 · 字节 {}–{} / {}",
+                                    preview.cursor.line + 1,
+                                    if preview.cursor.continuation {
+                                        "（续）"
+                                    } else {
+                                        ""
+                                    },
+                                    preview.cursor.byte_offset,
+                                    preview.end.byte_offset,
+                                    preview.file_bytes
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                        }
                     });
             }
         });
@@ -695,7 +805,11 @@ impl CompareApp {
         }
         if diff.rows.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("两份文件均为空");
+                ui.label(if session.is_read_only() {
+                    "两侧当前页均无文本"
+                } else {
+                    "两份文件均为空"
+                });
             });
             return;
         }
@@ -732,6 +846,10 @@ impl CompareApp {
                             selected: row.hunk == Some(*selected),
                             offset,
                             search: &self.search,
+                            line_offsets: [
+                                session.left.preview.as_ref().map_or(0, |p| p.cursor.line),
+                                session.right.preview.as_ref().map_or(0, |p| p.cursor.line),
+                            ],
                         },
                     );
                 }
@@ -751,25 +869,31 @@ impl CompareApp {
     fn refresh_directory_filter(&mut self) {
         self.copy.selection.clear();
         self.filtered_entries.clear();
+        self.directory_counts = [0; 3];
         let filter = self.directory_filter.to_lowercase();
         if let Some(report) = &self.directory {
-            self.filtered_entries.extend(
-                report
-                    .entries
+            self.directory_search_keys.extend(
+                report.entries[self.directory_search_keys.len()..]
                     .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| {
-                        (!self.hide_equal
-                            || !matches!(entry.status, EntryStatus::Equal | EntryStatus::Directory))
-                            && (filter.is_empty()
-                                || entry
-                                    .relative_path
-                                    .to_string_lossy()
-                                    .to_lowercase()
-                                    .contains(&filter))
-                    })
-                    .map(|(index, _)| index),
+                    .map(|entry| entry.relative_path.to_string_lossy().to_lowercase()),
             );
+            for (index, entry) in report.entries.iter().enumerate() {
+                match entry.status {
+                    EntryStatus::Pending => self.directory_counts[1] += 1,
+                    EntryStatus::Equal | EntryStatus::Directory => {}
+                    EntryStatus::Error => {
+                        self.directory_counts[0] += 1;
+                        self.directory_counts[2] += 1;
+                    }
+                    _ => self.directory_counts[0] += 1,
+                }
+                if (!self.hide_equal
+                    || !matches!(entry.status, EntryStatus::Equal | EntryStatus::Directory))
+                    && (filter.is_empty() || self.directory_search_keys[index].contains(&filter))
+                {
+                    self.filtered_entries.push(index);
+                }
+            }
         }
     }
 
@@ -804,6 +928,7 @@ impl CompareApp {
             self.mark_state_dirty();
         }
         self.copy_toolbar(ui);
+        self.directory_progress_label(ui);
         let Some(report) = &self.directory else {
             ui.add_space(40.0);
             ui.label("点击右上角“打开文件夹”，选择两个目录开始比较。");
@@ -823,10 +948,11 @@ impl CompareApp {
         );
         ui.add_space(10.0);
         ui.label(format!(
-            "{} 项 · {} 项差异 · {} 个读取错误 · 当前显示 {} 项",
+            "{} 项 · {} 项已确认差异 · {} 个待比较 · {} 个读取错误 · 当前显示 {} 项",
             report.entries.len(),
-            report.different_count(),
-            report.error_count(),
+            self.directory_counts[0],
+            self.directory_counts[1],
+            self.directory_counts[2],
             self.filtered_entries.len()
         ));
         ui.add_space(8.0);
@@ -857,7 +983,7 @@ impl CompareApp {
                             Vec2::new(ui.available_width(), 30.0),
                             Sense::click(),
                         );
-                        if response.clicked() {
+                        if response.clicked() && report.complete {
                             *selected = Some(index);
                             if ui.input(|i| i.modifiers.command) {
                                 if !selection.remove(&index) {
@@ -869,6 +995,8 @@ impl CompareApp {
                             }
                         }
                         if response.double_clicked()
+                            && self.busy.is_none()
+                            && report.complete
                             && entry.left_kind == Some(EntryKind::File)
                             && entry.right_kind == Some(EntryKind::File)
                         {
@@ -1207,7 +1335,12 @@ impl eframe::App for CompareApp {
                         && !self.open_dialog
                         && self.copy.preview.is_none()
                         && self.copy.report.is_none()
-                        && self.busy.is_none(),
+                        && (self.busy.is_none()
+                            || (self.view == View::Directory
+                                && self
+                                    .busy
+                                    .as_ref()
+                                    .is_some_and(|b| b.kind == BusyKind::Directory))),
                     |ui| match self.view {
                         View::Text => self.text_view(ui),
                         View::Directory => self.directory_view(ui),
@@ -1232,6 +1365,7 @@ fn side_label(side: Side) -> &'static str {
 
 fn status_style(status: EntryStatus) -> (&'static str, Color32) {
     match status {
+        EntryStatus::Pending => ("待比较", MUTED),
         EntryStatus::Equal => ("相同", MUTED),
         EntryStatus::Directory => ("目录", MUTED),
         EntryStatus::Different => ("内容不同", Color32::from_rgb(245, 190, 115)),
@@ -1247,6 +1381,7 @@ struct RowPaint<'a> {
     right: &'a DocumentSnapshot,
     selected: bool,
     offset: f32,
+    line_offsets: [u64; 2],
     search: &'a search_ui::SearchState,
 }
 
@@ -1284,7 +1419,7 @@ fn paint_diff_row(ui: &egui::Ui, rect: Rect, row: &AlignedRow, paint: &RowPaint<
         ui.painter().with_clip_rect(gutter).text(
             Pos2::new(gutter.right() - 9.0, cell.center().y),
             egui::Align2::RIGHT_CENTER,
-            index + 1,
+            index as u64 + paint.line_offsets[usize::from(side == Side::Right)] + 1,
             FontId::monospace(12.0),
             MUTED,
         );

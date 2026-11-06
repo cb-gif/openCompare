@@ -10,6 +10,7 @@ name = "bcompare"
 path = "src/main.rs"
 
 [dependencies]
+compare-app.workspace = true
 compare-core.workspace = true
 compare-fs.workspace = true
 clap.workspace = true
