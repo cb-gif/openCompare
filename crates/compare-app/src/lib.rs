@@ -1,13 +1,15 @@
 //! Session history and a single, latest-request-wins background worker.
+mod open;
 mod persistence;
 use compare_core::{
     compare, search_documents, CompareOptions, DiffResult, DocumentSnapshot, MergeError,
     SearchResults, Side,
 };
 use compare_fs::{
-    compare_directories, execute_copy, load_document, prepare_copy, save_document, CopyPlan,
-    CopyReport, DirectoryReport, LoadedDocument, TextEncoding,
+    compare_directories_streaming, execute_copy, prepare_copy, save_document, CopyPlan, CopyReport,
+    DirectoryBatch, DirectoryReport, LoadedDocument, PreviewCursor, TextEncoding,
 };
+pub use open::{load_preview_session_page, open_text_session};
 pub use persistence::{default_state_path, AppState, ComparisonKind, StoredComparison};
 use std::{
     collections::VecDeque,
@@ -36,6 +38,8 @@ pub struct TextSession {
     pub left: LoadedDocument,
     pub right: LoadedDocument,
     pub diff: Option<DiffResult>,
+    /// Complete-file byte comparison; present only in bounded preview mode.
+    pub byte_equal: Option<bool>,
     undo: VecDeque<Edit>,
     redo: Vec<Edit>,
     history_bytes: usize,
@@ -43,11 +47,17 @@ pub struct TextSession {
 
 impl TextSession {
     pub fn new(left: LoadedDocument, right: LoadedDocument, options: CompareOptions) -> Self {
+        let options = if left.preview.is_some() || right.preview.is_some() {
+            CompareOptions::default()
+        } else {
+            options
+        };
         let diff = compare(&left.document, &right.document, options);
         Self {
             left,
             right,
             diff: Some(diff),
+            byte_equal: None,
             undo: VecDeque::new(),
             redo: Vec::new(),
             history_bytes: 0,
@@ -69,6 +79,9 @@ impl TextSession {
     pub fn is_dirty(&self) -> bool {
         self.left.is_dirty() || self.right.is_dirty()
     }
+    pub fn is_read_only(&self) -> bool {
+        self.left.preview.is_some() || self.right.preview.is_some()
+    }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -77,6 +90,9 @@ impl TextSession {
     }
 
     pub fn edit(&mut self, side: Side, text: impl Into<Arc<str>>) {
+        if self.is_read_only() {
+            return;
+        }
         let text = text.into();
         let before = self.document(side).document.shared_text();
         if before == text {
@@ -100,6 +116,9 @@ impl TextSession {
     }
 
     pub fn accept(&mut self, hunk: usize, source: Side) -> Result<(), MergeError> {
+        if self.is_read_only() {
+            return Err(MergeError::ReadOnly);
+        }
         let diff = self.diff.as_ref().ok_or(MergeError::StaleResult)?;
         let text = diff.accept_hunk(hunk, source, &self.left.document, &self.right.document)?;
         let target = match source {
@@ -134,7 +153,11 @@ impl TextSession {
         Job::CompareText {
             left: self.left.document.clone(),
             right: self.right.document.clone(),
-            options,
+            options: if self.is_read_only() {
+                CompareOptions::default()
+            } else {
+                options
+            },
         }
     }
 
@@ -150,6 +173,11 @@ impl TextSession {
 }
 
 pub enum Job {
+    PreviewPage {
+        documents: Box<[LoadedDocument; 2]>,
+        cursors: [PreviewCursor; 2],
+        byte_equal: bool,
+    },
     PrepareCopy {
         source_root: PathBuf,
         destination_root: PathBuf,
@@ -185,6 +213,7 @@ pub enum Job {
 }
 
 pub enum JobOutput {
+    PreviewPage(Box<TextSession>),
     CopyPrepared(CopyPlan),
     Copied(CopyReport),
     Searched(SearchResults),
@@ -207,6 +236,10 @@ struct Pending {
     job: Job,
     cancel: Arc<AtomicBool>,
 }
+struct DirectoryEvent {
+    id: u64,
+    batch: DirectoryBatch,
+}
 #[derive(Default)]
 struct Mailbox {
     pending: Option<Pending>,
@@ -217,6 +250,7 @@ struct Mailbox {
 pub struct ComparisonWorker {
     mailbox: Arc<(Mutex<Mailbox>, Condvar)>,
     results: Receiver<JobResult>,
+    directory_updates: Receiver<DirectoryEvent>,
     pub progress: Arc<AtomicUsize>,
     pub current_id: u64,
 }
@@ -232,6 +266,7 @@ impl ComparisonWorker {
         let mailbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
         let progress = Arc::new(AtomicUsize::new(0));
         let (sender, results) = mpsc::channel();
+        let (directory_sender, directory_updates) = mpsc::sync_channel(8);
         let shared_mailbox = mailbox.clone();
         let shared_progress = progress.clone();
         std::thread::Builder::new()
@@ -252,7 +287,27 @@ impl ComparisonWorker {
                 if request.cancel.load(Ordering::Relaxed) && !must_report {
                     continue;
                 }
-                let result = execute(request.job, &request.cancel, &shared_progress);
+                let id = request.id;
+                let cancel = request.cancel.clone();
+                let result = execute(request.job, &request.cancel, &shared_progress, |batch| {
+                    let mut update = DirectoryEvent { id, batch };
+                    loop {
+                        match directory_sender.try_send(update) {
+                            Ok(()) => break,
+                            Err(mpsc::TrySendError::Full(returned)) => {
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                update = returned;
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                cancel.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                });
                 if (must_report || !request.cancel.load(Ordering::Relaxed))
                     && sender
                         .send(JobResult {
@@ -268,6 +323,7 @@ impl ComparisonWorker {
         Self {
             mailbox,
             results,
+            directory_updates,
             progress,
             current_id: 0,
         }
@@ -319,6 +375,18 @@ impl ComparisonWorker {
         }
         None
     }
+
+    pub fn poll_directory_updates(&self) -> Vec<DirectoryBatch> {
+        let mut batches = Vec::new();
+        for _ in 0..8 {
+            match self.directory_updates.try_recv() {
+                Ok(event) if event.id == self.current_id => batches.push(event.batch),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        batches
+    }
 }
 
 impl Drop for ComparisonWorker {
@@ -330,8 +398,20 @@ impl Drop for ComparisonWorker {
     }
 }
 
-fn execute(job: Job, cancel: &AtomicBool, progress: &AtomicUsize) -> Result<JobOutput, String> {
+fn execute(
+    job: Job,
+    cancel: &AtomicBool,
+    progress: &AtomicUsize,
+    mut directory_update: impl FnMut(DirectoryBatch),
+) -> Result<JobOutput, String> {
     match job {
+        Job::PreviewPage {
+            documents,
+            cursors,
+            byte_equal,
+        } => load_preview_session_page(&documents[0], &documents[1], cursors, byte_equal, cancel)
+            .map(|session| JobOutput::PreviewPage(Box::new(session)))
+            .map_err(|e| e.to_string()),
         Job::PrepareCopy {
             source_root,
             destination_root,
@@ -364,24 +444,25 @@ fn execute(job: Job, cancel: &AtomicBool, progress: &AtomicUsize) -> Result<JobO
             left_encoding,
             right_encoding,
             options,
-        } => {
-            let left = load_document(&left, left_encoding).map_err(|e| e.to_string())?;
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Cancelled".into());
-            }
-            let right = load_document(&right, right_encoding).map_err(|e| e.to_string())?;
-            Ok(JobOutput::Opened(Box::new(TextSession::new(
-                left, right, options,
-            ))))
-        }
+        } => open_text_session(
+            &left,
+            &right,
+            left_encoding,
+            right_encoding,
+            options,
+            cancel,
+        )
+        .map(|session| JobOutput::Opened(Box::new(session)))
+        .map_err(|e| e.to_string()),
         Job::CompareText {
             left,
             right,
             options,
         } => Ok(JobOutput::Compared(compare(&left, &right, options))),
         Job::CompareDirectories { left, right } => {
-            compare_directories(&left, &right, cancel, |count| {
-                progress.store(count, Ordering::Relaxed)
+            compare_directories_streaming(&left, &right, cancel, |batch| {
+                progress.store(batch.scanned, Ordering::Relaxed);
+                directory_update(batch);
             })
             .map(JobOutput::Directory)
             .map_err(|e| e.to_string())
@@ -469,6 +550,49 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_full_directory_update_queue_does_not_block_cancellation_or_publish_stale_batches() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for index in 0..1200 {
+            std::fs::write(left.path().join(format!("item-{index}")), "x").unwrap();
+        }
+        let mut worker = ComparisonWorker::new();
+        worker.submit(Job::CompareDirectories {
+            left: left.path().to_owned(),
+            right: right.path().to_owned(),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while worker.progress.load(Ordering::Relaxed) < 1024 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan did not fill the bounded update queue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        worker.cancel();
+        worker.submit(Job::CompareText {
+            left: DocumentSnapshot::new("latest", 1),
+            right: DocumentSnapshot::new("latest", 1),
+            options: CompareOptions::default(),
+        });
+        loop {
+            if let Some(result) = worker.poll() {
+                let JobOutput::Compared(diff) = result.result.unwrap() else {
+                    panic!("stale directory result published")
+                };
+                assert!(diff.hunks.is_empty());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellation did not unblock the worker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(worker.poll_directory_updates().is_empty());
     }
 
     #[test]

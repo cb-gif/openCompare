@@ -20,6 +20,9 @@ impl CompareApp {
         let Some(report) = &self.directory else {
             return false;
         };
+        if !report.complete {
+            return false;
+        }
         self.copy.selection.iter().all(|index| {
             let Some(entry) = report.entries.get(*index) else {
                 return false;
@@ -71,7 +74,17 @@ impl CompareApp {
 
     pub(super) fn copy_toolbar(&mut self, ui: &mut egui::Ui) {
         let mut direction = None;
+        let mut rescan = false;
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.busy.is_none() && self.directory.is_some(),
+                    egui::Button::new("重新扫描"),
+                )
+                .clicked()
+            {
+                rescan = true;
+            }
             if ui
                 .add_enabled(
                     self.can_copy_selection(Side::Left),
@@ -118,6 +131,17 @@ impl CompareApp {
                 .color(MUTED),
             );
         });
+        if rescan {
+            if let Some(report) = &self.directory {
+                self.submit(
+                    Job::CompareDirectories {
+                        left: report.left.clone(),
+                        right: report.right.clone(),
+                    },
+                    BusyKind::Directory,
+                );
+            }
+        }
         if self.session.as_ref().is_some_and(TextSession::is_dirty) {
             ui.label(
                 RichText::new("请先保存或撤销文本修改，再执行目录复制")
