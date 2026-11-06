@@ -1,0 +1,6 @@
+/target/
+/.tools/
+/.rust-compare/
+*.tmp
+*.log
+

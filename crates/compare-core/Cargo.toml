@@ -1,0 +1,12 @@
+[package]
+name = "compare-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+similar.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+

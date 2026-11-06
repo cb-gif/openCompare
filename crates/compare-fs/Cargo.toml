@@ -1,0 +1,16 @@
+[package]
+name = "compare-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+compare-core.workspace = true
+encoding_rs.workspace = true
+blake3.workspace = true
+walkdir.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+

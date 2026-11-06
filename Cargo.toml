@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/compare-core",
+    "crates/compare-fs",
+    "crates/compare-app",
+    "crates/compare-cli",
+    "crates/compare-gui",
+]
+default-members = ["crates/compare-gui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+compare-core = { path = "crates/compare-core" }
+compare-fs = { path = "crates/compare-fs" }
+compare-app = { path = "crates/compare-app" }
+similar = { version = "2.7", features = ["unicode"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+encoding_rs = "0.8"
+blake3 = { version = "1.8", features = ["pure"] }
+walkdir = "2.5"
+tempfile = "3"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = "0.15"
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
