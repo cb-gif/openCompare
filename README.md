@@ -1,106 +1,66 @@
-# Rust Compare
+# openCompare
 
-使用 Rust 开发的本地文件与目录比较工具。当前原型支持文本比较与搜索、会话恢复和目录文件复制，采用独立比较核心、文件系统层、会话层、CLI 和 egui 桌面界面。
+**面向 Windows 和 macOS 的开源文件比较与合并工具。**
 
-## 运行
+从目录定位变化，在双栏文本视图中检查、编辑和接受差异，再将确认的内容保存或复制到目标位置。文件处理在本地完成。
 
-安装 Rust stable 与 Windows 的 Visual Studio C++ Build Tools 后：
+[下载安装](https://github.com/cb-gif/openCompare/releases) · [开发文档与进度](AGENTS.md) · [反馈问题](https://github.com/cb-gif/openCompare/issues)
 
-```powershell
-cargo run -p compare-gui
-```
+> 项目处于开发阶段。下列内容定义产品使用方式与功能范围；可用能力、最低系统版本和安装包以对应 Release 说明为准。
 
-也可以直接传入两份文件或两个目录：
+## 功能范围
 
-```powershell
-cargo run -p compare-gui -- fixtures/left/example.rs fixtures/right/example.rs
-cargo run -p compare-gui -- fixtures/left fixtures/right
-```
+| 工作场景 | 能力 |
+| --- | --- |
+| 文本比较 | 双栏对齐、行内差异、差异导航、查找替换、语法高亮、剪贴板文本 |
+| 编辑与合并 | 直接编辑、接受选中差异、撤销与重做、显式保存 |
+| 目录比较 | 目录树、相对路径配对、筛选与排除、差异状态、文件跳转 |
+| 选择性复制 | 操作预览、覆盖检查、进度、取消和逐项结果 |
+| 工作会话 | 多标签、最近打开、命名会话、比较规则和显示偏好 |
+| Git 工作流 | difftool、三方合并与 mergetool |
+| 结果分享 | 比较报告、机器可读摘要、文本补丁导出 |
 
-本项目已在 `.tools/` 安装隔离的 Rust 工具链，不修改系统 PATH。当前机器可使用：
+各项功能的交付状态可从 [项目文档入口](AGENTS.md) 的开发计划查看。
 
-```powershell
-.\scripts\dev.ps1 run -p compare-gui
-```
+## 下载与安装
 
-在其他 Windows 机器需要隔离安装时，可执行 `node scripts/bootstrap.mjs`。它从 Rust 官方站点下载 rustup，安装位置为 `.tools/cargo` 和 `.tools/rustup`；仍需已安装的 C++ 链接工具。
+从 [GitHub Releases](https://github.com/cb-gif/openCompare/releases) 选择稳定版；带有预发布标识的版本用于试用和反馈。下载与设备架构对应的文件：
 
-## 当前功能
+| 设备 | 安装包 | 安装方式 |
+| --- | --- | --- |
+| Windows，Intel / AMD 64 位 | `windows-x64-setup.exe` | 运行安装程序 |
+| Mac，Apple Silicon | `macos-arm64.dmg` | 打开 DMG，将应用拖入 Applications |
+| Mac，Intel | `macos-x64.dmg` | 打开 DMG，将应用拖入 Applications |
 
-- 双栏对齐、行级与行内高亮、差异块导航、同步纵向滚动。
-- 忽略行尾空白、大小写及换行符；比较规则不修改原文。
-- 将选中差异块接收到另一侧，撤销 / 重做，基础编辑及显式保存。
-- `Ctrl+F` 查找两侧文本，高亮匹配；`F3` / `Shift+F3` 跳转下一处 / 上一处。支持区分大小写，最多显示 10,000 个匹配。
-- UTF-8、UTF-16 LE / BE、GBK。BOM 自动识别；无 BOM 的 GBK / UTF-16 在打开窗口手动选择，解码不做静默字符替换。
-- 保存前检查磁盘内容变化，同目录临时文件写入后替换原文件。只读文件与最终路径为符号链接的文件拒绝保存。
-- 按相对路径递归比较目录，逐字节比较同大小文件，显示单侧文件、内容差异、类型冲突与读取错误。
-- 默认不跟随目录内的符号链接；链接比较的是链接目标路径。
-- 后台比较、扫描进度、取消与过期结果检查。
-- 文件选择、路径输入、拖入两个文件或目录，未保存修改的关闭 / 会话切换提示。
-- 最近会话自动记录，启动时重新打开上次的文件或目录；保留编码、比较规则、目录筛选与窗口大小。
-- 目录文件可单选、`Ctrl+单击` 多选，或选择可见文件；支持复制预览、新建父目录、覆盖、取消、逐项结果及自动刷新。
+文件名包含版本号，以上仅列平台后缀。以发布页实际列出的资源为准；未提供的架构不视为已支持。Windows ARM64、Linux 和便携包的状态见开发计划。
 
-原型的限制：文本打开上限 16 MiB，自由编辑上限 512 KiB，较大的文本仍可按块合并。长行通常预览前 4,000 个 UTF-8 字节，查找更后的匹配时切换到匹配附近；底层文本完整保留。查找支持单行字面文本，不含正则、多行匹配或替换；不区分大小写时按 Unicode 小写比较。暂未实现三方合并、语法高亮和 Git 工具集成。目录按相对路径的原始大小写精确配对，暂未提供大小写不敏感的配对规则。
+普通使用无需安装 Rust、Node.js 或前端开发工具。Windows 安装程序负责检查所需 WebView2 运行环境。
 
-Windows 上保存使用平台文件替换行为；需要保留 ACL、硬链接、备用数据流等特殊元数据的文件暂不建议通过本原型修改。跨进程同时写入存在常规检查与替换之间的竞争窗口，当前版本不提供文件锁或整批事务。
+## 开始比较
 
-中文字体从系统读取，不分发字体文件。Windows 优先使用微软雅黑 / 黑体，macOS / Linux 提供常见 CJK 字体位置作为回退。
+1. 打开应用，选择文本比较或目录比较。
+2. 选择左右两侧文件或目录；也可拖入一对路径。
+3. 使用筛选和差异导航定位需要处理的内容。
+4. 在文本视图编辑或接受差异；在目录视图预览需要复制的文件。
+5. 确认目标后保存或执行复制，并检查操作结果。
 
-## 目录文件复制
+比较规则只影响差异判定。文本相同、按规则相同、格式不同和字节相同是不同状态。
 
-打开两份目录并选中文件后，点击“复制到右侧…”或“复制到左侧…”，检查预览中的来源、目标、新建 / 覆盖清单，再执行复制。筛选变化时会清除选择，避免复制已隐藏的选中项。
+## 文件与隐私
 
-预览使用 BLAKE3 内容指纹。执行前检查整批来源和目标，提交每个文件前再次检查；若预览后的内容变化，即使大小与修改时间相同，也会拒绝覆盖。每个文件先写同目录临时文件，再替换目标；新增目标使用不覆盖已有文件的提交方式。
+- 编码、BOM 和换行格式需要显式保留或转换；无法解码、编码时报告错误。
+- 保存前检查磁盘内容变化，避免静默覆盖外部修改。
+- 批量操作逐项报告；取消保留已经成功完成的操作，不代表整批回滚。
+- 不支持的文件类型、特殊元数据或文件大小会给出明确限制。
+- 核心比较流程离线运行；诊断信息不应包含文件正文，提交问题前可检查并脱敏路径。
 
-取消保留已经复制成功的文件，结果窗口列出成功、失败、取消及未执行项。复制完成后自动刷新目录。如果覆盖了正在比较的文件，请从目录重新打开最新内容。存在未保存文本修改时，复制按钮暂不可用。
+## 反馈与贡献
 
-当前复制限普通文件，按需创建父目录；不复制目录项本身、符号链接、junction 或其他 reparse point。复制侧重文件内容，不保留原修改时间、ACL、备用数据流等特殊元数据。执行仍存在文件系统检查与提交之间的常规竞争窗口，不提供整批回滚。
+提交问题时附上应用版本、系统版本、CPU 架构、复现步骤和预期结果。涉及编码或比较异常时，可提供不含敏感信息的最小样本。
 
-## 会话配置
+开发环境、产品与架构规范、实施计划和 AI 开发流程统一从 [AGENTS.md](AGENTS.md) 进入。
 
-默认以便携模式保存在可执行文件旁的 `.rust-compare/sessions.json`；本机开发构建对应 `target/debug/.rust-compare/sessions.json`。也可以通过 `RUST_COMPARE_STATE_DIR` 指定配置目录。
+## 许可证
 
-配置只保存路径、编码和偏好，不保存未落盘的文档内容。最近记录保留 10 条，侧栏显示最近 5 条；点击“打开示例会话”会让下次启动回到示例，最近记录仍保留。相对目录输入会转成绝对路径保存，恢复不依赖之后的工作目录。
-
-无法读取、损坏或版本不兼容的配置会显示错误并保留原文件，本次运行不会覆盖它。
-
-## 命令行
-
-```powershell
-cargo run -p compare-cli -- diff fixtures/left/example.rs fixtures/right/example.rs
-cargo run -p compare-cli -- diff fixtures/left/example.rs fixtures/right/example.rs --json
-cargo run -p compare-cli -- diff LEFT RIGHT --ignore-case --ignore-trailing-whitespace --ignore-line-endings
-cargo run -p compare-cli -- diff LEFT RIGHT --left-encoding gbk --right-encoding utf8
-cargo run -p compare-cli -- dir fixtures/left fixtures/right --differences-only
-```
-
-返回码：`0` 表示按选定规则相同，`1` 表示有差异，`2` 表示读取、解码或比较错误。JSON 的行区间为从零开始、左闭右开的区间。默认文本输出为不带上下文的差异块；开启忽略规则后，输出仅描述被视为重要的变化，不是字节级完整补丁。
-
-在本机使用隔离工具链时，将上面的 `cargo` 换成 `.\scripts\dev.ps1`。
-PowerShell 脚本转发 `--` 时需加引号，例如：
-
-```powershell
-.\scripts\dev.ps1 run -p compare-cli '--' diff fixtures/left/example.rs fixtures/right/example.rs
-.\scripts\dev.ps1 clippy --workspace --all-targets '--' -D warnings
-```
-
-## 开发检查
-
-```powershell
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build -p compare-gui -p compare-cli
-```
-
-```text
-crates/compare-core   原文快照、行索引、差异、合并
-crates/compare-fs     编码、目录、受保护的保存
-crates/compare-app    会话、撤销 / 重做、后台任务
-crates/compare-gui    egui 桌面应用
-crates/compare-cli    bcompare 命令行程序
-fixtures/            可直接打开的示例
-```
-
-后续范围和验收标准见 [PLAN.md](PLAN.md)。
+[MIT](LICENSE)。
 

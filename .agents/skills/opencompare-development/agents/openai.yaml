@@ -1,0 +1,4 @@
+interface:
+  display_name: "openCompare 开发规范"
+  short_description: "按共享架构、文件保护和验收规则完成 openCompare 开发、修复与评审"
+  default_prompt: "使用 $opencompare-development 从 AGENTS.md 入口定位 docs/dev/plan.md 中指定任务，核对实现与依赖，记录真实验收结果。"
